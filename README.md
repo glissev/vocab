@@ -11,6 +11,10 @@ The default language pair is Bulgarian ⇄ Korean; any pair can be chosen on fir
 - **Add words from either side.** Fill in one language or both; entries missing a side show up as
   "needs translation" and are left out of quizzes until completed. Alternative translations are
   separated with `;` (`хубав; красив`) and all of them count as correct answers.
+- **Automatic translation.** Type a word on either side and the other side fills in with a machine
+  translation (free [MyMemory](https://mymemory.translated.net/) API, about 5,000 characters a day, no key).
+  The suggestion is tinted until you edit it; extra suggestions can be added as variants with one click.
+  Your own text is never overwritten. Turn it off in Settings → Adding words.
 - **Duplicate check** on save, with an option to merge into the existing word.
 - **Search** across both languages (case- and stress-mark-insensitive); filter by tag or by missing translation.
 - **Quizzes** in either direction or both ways, drawn from words due for review, all words, a tag,
@@ -32,6 +36,7 @@ The default language pair is Bulgarian ⇄ Korean; any pair can be chosen on fir
 | Database | Cloud Firestore with offline persistence | €0 on the Spark plan |
 | Hosting | Firebase Hosting (`<project>.web.app`) | €0 |
 | CI/CD | GitHub Actions | €0 for public repos (private repos have free monthly minutes) |
+| Translation | MyMemory public API, called from the browser | €0 (daily character limit) |
 | Custom domain | optional | ~€10–20 / year |
 
 There is no backend server: the browser talks to Firestore directly, and `firestore.rules` makes sure

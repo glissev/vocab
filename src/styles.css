@@ -338,6 +338,33 @@ textarea {
 .side-b .word-input {
   border-bottom: 2px solid var(--side-b);
 }
+/* automatic translation */
+.entry-form .field {
+  align-content: start;
+}
+.side-a .word-input.is-auto {
+  background: var(--side-a-soft);
+}
+.side-b .word-input.is-auto {
+  background: var(--side-b-soft);
+}
+.translate-note {
+  font-size: 0.8rem;
+  color: var(--muted);
+  min-height: 1.2rem;
+}
+.translate-note:empty {
+  min-height: 0;
+}
+.translate-error {
+  color: var(--bad);
+}
+.translate-alts .link-btn {
+  font-family: var(--font-word);
+  font-size: 0.85rem;
+  margin-left: 0.5rem;
+  padding: 0;
+}
 .hint {
   font-size: 0.85rem;
   color: var(--muted);

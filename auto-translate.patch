@@ -1,0 +1,645 @@
+diff -ruN -x node_modules -x dist base/README.md vocab/README.md
+--- base/README.md	2026-10-06 13:11:13.908552268 +0000
++++ vocab/README.md	2026-10-06 13:11:13.901168983 +0000
+@@ -11,6 +11,10 @@
+ - **Add words from either side.** Fill in one language or both; entries missing a side show up as
+   "needs translation" and are left out of quizzes until completed. Alternative translations are
+   separated with `;` (`хубав; красив`) and all of them count as correct answers.
++- **Automatic translation.** Type a word on either side and the other side fills in with a machine
++  translation (free [MyMemory](https://mymemory.translated.net/) API, about 5,000 characters a day, no key).
++  The suggestion is tinted until you edit it; extra suggestions can be added as variants with one click.
++  Your own text is never overwritten. Turn it off in Settings → Adding words.
+ - **Duplicate check** on save, with an option to merge into the existing word.
+ - **Search** across both languages (case- and stress-mark-insensitive); filter by tag or by missing translation.
+ - **Quizzes** in either direction or both ways, drawn from words due for review, all words, a tag,
+@@ -32,6 +36,7 @@
+ | Database | Cloud Firestore with offline persistence | €0 on the Spark plan |
+ | Hosting | Firebase Hosting (`<project>.web.app`) | €0 |
+ | CI/CD | GitHub Actions | €0 for public repos (private repos have free monthly minutes) |
++| Translation | MyMemory public API, called from the browser | €0 (daily character limit) |
+ | Custom domain | optional | ~€10–20 / year |
+ 
+ There is no backend server: the browser talks to Firestore directly, and `firestore.rules` makes sure
+diff -ruN -x node_modules -x dist base/src/components/EntryForm.tsx vocab/src/components/EntryForm.tsx
+--- base/src/components/EntryForm.tsx	2026-10-06 13:11:13.910571758 +0000
++++ vocab/src/components/EntryForm.tsx	2026-10-06 13:06:42.956702427 +0000
+@@ -1,8 +1,9 @@
+-import { useEffect, useRef, useState } from 'react';
++import { useEffect, useRef, useState, type ReactNode } from 'react';
+ import { addEntry, findDuplicates, updateEntry } from '../data/store';
+ import { onEnter } from '../lib/hooks';
+ import { exampleWord, languageName, textDirection } from '../lib/languages';
+ import { joinVariants, splitVariants } from '../lib/text';
++import { TranslateError, autoTranslatePlan, isAbort, otherSide, translateWord, type AutoFill, type Side } from '../lib/translate';
+ import type { Entry, EntryDraft, Profile } from '../lib/types';
+ import { LangTag } from './LangTag';
+ 
+@@ -34,8 +35,142 @@
+   const [dupes, setDupes] = useState<Entry[]>([]);
+   const [saved, setSaved] = useState<string | null>(null);
+   const firstField = useRef<HTMLInputElement>(null);
++  const secondField = useRef<HTMLInputElement>(null);
++
++  // Automatic translation: `auto` is the value the app wrote into one side; it counts as a
++  // suggestion until the user edits that side, and is replaced when the source word changes.
++  const [auto, setAuto] = useState<AutoFill | null>(null);
++  const [alts, setAlts] = useState<string[]>([]);
++  const [tStatus, setTStatus] = useState<{ side: Side; kind: 'loading' | 'error'; message?: string } | null>(null);
++  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
++  const abort = useRef<AbortController | null>(null);
++  const pendingRun = useRef<(() => void) | null>(null);
++
++  const texts = { a: aText, b: bText };
++  const setters = { a: setAText, b: setBText };
++  const langs = { a: profile.langA, b: profile.langB };
++  const fields = { a: firstField, b: secondField };
++
++  function cancelTranslation() {
++    clearTimeout(timer.current);
++    pendingRun.current = null;
++    abort.current?.abort();
++    abort.current = null;
++  }
++
++  function clearAuto() {
++    cancelTranslation();
++    setAuto(null);
++    setAlts([]);
++    setTStatus(null);
++  }
++
++  useEffect(() => cancelTranslation, []);
++
++  function changeSide(side: Side, value: string) {
++    setters[side](value);
++    setError(null);
++    setDupes([]);
++    cancelTranslation();
++    setTStatus(null);
++
++    // Typing into the auto-filled side makes it the user's own text.
++    const current = auto && auto.side === side ? null : auto;
++    if (current !== auto) {
++      setAuto(null);
++      setAlts([]);
++    }
++    if (!profile.autoTranslate) return;
++
++    const target = otherSide(side);
++    const plan = autoTranslatePlan(side, value, texts[target], current);
++    if (plan === 'clear') {
++      setters[target]('');
++      setAuto(null);
++      setAlts([]);
++      return;
++    }
++    if (plan !== 'translate') return;
++
++    const from = langs[side];
++    const to = langs[target];
++    const run = (focusTarget: boolean) => {
++      clearTimeout(timer.current);
++      pendingRun.current = null;
++      if (!navigator.onLine) return;
++      const ctrl = new AbortController();
++      abort.current = ctrl;
++      setTStatus({ side: target, kind: 'loading' });
++      translateWord(value, from, to, ctrl.signal)
++        .then(([first, ...rest]) => {
++          if (ctrl.signal.aborted) return;
++          abort.current = null;
++          setTStatus(null);
++          if (!first) return;
++          setters[target](first);
++          setAuto({ side: target, value: first });
++          setAlts(rest);
++          if (focusTarget) fields[target].current?.focus();
++        })
++        .catch((err: unknown) => {
++          if (ctrl.signal.aborted || isAbort(err)) return;
++          abort.current = null;
++          // Don't leave the previous word's translation standing next to a new word.
++          if (current) {
++            setters[target]((t) => (t === current.value ? '' : t));
++            setAuto(null);
++            setAlts([]);
++          }
++          const message = err instanceof TranslateError ? err.message : 'Couldn’t translate this word. Type the translation yourself.';
++          setTStatus({ side: target, kind: 'error', message });
++        });
++    };
++    pendingRun.current = () => run(true);
++    timer.current = setTimeout(() => run(false), 600);
++  }
++
++  function addAlternative(word: string) {
++    if (!auto) return;
++    const value = joinVariants([...splitVariants(texts[auto.side]), word]);
++    setters[auto.side](value);
++    setAuto({ side: auto.side, value });
++    setAlts((list) => list.filter((w) => w !== word));
++  }
++
++  function translateNote(side: Side) {
++    let content: ReactNode = null;
++    if (tStatus?.side === side) {
++      content = tStatus.kind === 'loading' ? 'Translating…' : <span className="translate-error">{tStatus.message}</span>;
++    } else if (auto?.side === side && texts[side] === auto.value) {
++      content = (
++        <>
++          Automatic translation. Check it before saving.
++          {alts.length > 0 && (
++            <span className="translate-alts">
++              {' '}Also:
++              {alts.map((w) => (
++                <button key={w} className="link-btn" lang={langs[side]} onClick={() => addAlternative(w)} title="Add as another translation">
++                  + {w}
++                </button>
++              ))}
++            </span>
++          )}
++        </>
++      );
++    }
++    return (
++      <div className="translate-note" aria-live="polite">
++        {content}
++      </div>
++    );
++  }
++
++  function isAuto(side: Side) {
++    return auto?.side === side && texts[side] === auto.value;
++  }
+ 
+   useEffect(() => {
++    clearAuto();
+     setAText(editing ? joinVariants(editing.a) : '');
+     setBText(editing ? joinVariants(editing.b) : '');
+     setNote(editing?.note ?? '');
+@@ -57,6 +192,7 @@
+   }
+ 
+   function reset(message: string) {
++    clearAuto();
+     setAText('');
+     setBText('');
+     setNote('');
+@@ -99,7 +235,13 @@
+     reset('Merged into existing word');
+   }
+ 
+-  const submit = onEnter(() => save());
++  // Enter while a translation is still waiting fetches it right away and moves to that side;
++  // a second Enter saves. Enter during a running request is ignored.
++  const submit = onEnter(() => {
++    if (pendingRun.current) return pendingRun.current();
++    if (abort.current) return;
++    save();
++  });
+ 
+   return (
+     <section className="panel entry-form" aria-label={editing ? 'Edit word' : 'Add a word'}>
+@@ -111,15 +253,11 @@
+           <input
+             id="ef-a"
+             ref={firstField}
+-            className="word-input"
++            className={isAuto('a') ? 'word-input is-auto' : 'word-input'}
+             lang={profile.langA}
+             dir={textDirection(profile.langA)}
+             value={aText}
+-            onChange={(e) => {
+-              setAText(e.target.value);
+-              setError(null);
+-              setDupes([]);
+-            }}
++            onChange={(e) => changeSide('a', e.target.value)}
+             onKeyDown={submit}
+             autoComplete="off"
+             autoCorrect="off"
+@@ -127,6 +265,7 @@
+             spellCheck={false}
+             placeholder={exampleWord(profile.langA)}
+           />
++          {translateNote('a')}
+         </div>
+         <div className="field side-b">
+           <label htmlFor="ef-b">
+@@ -134,15 +273,12 @@
+           </label>
+           <input
+             id="ef-b"
+-            className="word-input"
++            ref={secondField}
++            className={isAuto('b') ? 'word-input is-auto' : 'word-input'}
+             lang={profile.langB}
+             dir={textDirection(profile.langB)}
+             value={bText}
+-            onChange={(e) => {
+-              setBText(e.target.value);
+-              setError(null);
+-              setDupes([]);
+-            }}
++            onChange={(e) => changeSide('b', e.target.value)}
+             onKeyDown={submit}
+             autoComplete="off"
+             autoCorrect="off"
+@@ -150,9 +286,14 @@
+             spellCheck={false}
+             placeholder={exampleWord(profile.langB)}
+           />
++          {translateNote('b')}
+         </div>
+       </div>
+-      <p className="hint">Fill in one side or both. Separate alternative translations with “;”.</p>
++      <p className="hint">
++        {profile.autoTranslate
++          ? 'Type a word on either side and the other side fills in automatically. Separate alternative translations with “;”.'
++          : 'Fill in one side or both. Separate alternative translations with “;”.'}
++      </p>
+ 
+       {showMore ? (
+         <div className="pair">
+diff -ruN -x node_modules -x dist base/src/components/SettingsView.tsx vocab/src/components/SettingsView.tsx
+--- base/src/components/SettingsView.tsx	2026-10-06 13:11:13.911270979 +0000
++++ vocab/src/components/SettingsView.tsx	2026-10-06 13:05:49.586592789 +0000
+@@ -30,6 +30,18 @@
+       </section>
+ 
+       <section className="panel">
++        <h2>Adding words</h2>
++        <label className="checkbox">
++          <input type="checkbox" checked={profile.autoTranslate} onChange={(e) => saveProfile(uid, { autoTranslate: e.target.checked })} />
++          Translate new words automatically
++        </label>
++        <p className="hint">
++          When you type a word on one side, the other side fills in with a suggestion you can edit. Uses the free MyMemory
++          service, which receives the word you type and allows about 5,000 characters a day.
++        </p>
++      </section>
++
++      <section className="panel">
+         <h2>Quiz</h2>
+         <div className="field">
+           <label htmlFor="st-size">Default number of words</label>
+diff -ruN -x node_modules -x dist base/src/lib/translate.test.ts vocab/src/lib/translate.test.ts
+--- base/src/lib/translate.test.ts	1970-01-01 00:00:00.000000000 +0000
++++ vocab/src/lib/translate.test.ts	2026-10-06 13:05:44.438592211 +0000
+@@ -0,0 +1,104 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import {
++  TranslateError,
++  apiLang,
++  autoTranslatePlan,
++  cleanTranslation,
++  clearTranslationCache,
++  parseMyMemory,
++  queryFor,
++  translateWord,
++} from './translate';
++
++describe('autoTranslatePlan', () => {
++  it('translates into an empty other side', () => {
++    expect(autoTranslatePlan('a', 'ябълка', '', null)).toBe('translate');
++    expect(autoTranslatePlan('b', '사과', '  ', null)).toBe('translate');
++  });
++  it('replaces an untouched auto-translation', () => {
++    expect(autoTranslatePlan('a', 'ябълки', '사과', { side: 'b', value: '사과' })).toBe('translate');
++  });
++  it('never overwrites text the user typed', () => {
++    expect(autoTranslatePlan('a', 'ябълка', '사과', null)).toBe('none');
++    expect(autoTranslatePlan('a', 'ябълка', '사과나무', { side: 'b', value: '사과' })).toBe('none');
++  });
++  it('clears the auto-translation when the source is emptied', () => {
++    expect(autoTranslatePlan('a', '', '사과', { side: 'b', value: '사과' })).toBe('clear');
++    expect(autoTranslatePlan('a', ' ; ', '', null)).toBe('none');
++  });
++});
++
++describe('queryFor and apiLang', () => {
++  it('uses the first variant', () => {
++    expect(queryFor(' хубав; красив')).toBe('хубав');
++    expect(queryFor('')).toBe('');
++  });
++  it('maps Chinese to a region code', () => {
++    expect(apiLang('zh')).toBe('zh-CN');
++    expect(apiLang('ko')).toBe('ko');
++  });
++});
++
++describe('cleanTranslation', () => {
++  it('lower-cases a capital the source did not have', () => {
++    expect(cleanTranslation('Ябълка.', '사과', 'bg')).toBe('ябълка');
++    expect(cleanTranslation('Apple', 'ябълка', 'en')).toBe('apple');
++  });
++  it('keeps capitals for German, acronyms and capitalised sources', () => {
++    expect(cleanTranslation('Apfel', 'ябълка', 'de')).toBe('Apfel');
++    expect(cleanTranslation('USA', 'сащ', 'en')).toBe('USA');
++    expect(cleanTranslation('Seoul', 'Сеул', 'en')).toBe('Seoul');
++  });
++  it('decodes entities and strips quotes', () => {
++    expect(cleanTranslation('&quot;it&#39;s&quot;', 'това е', 'en')).toBe("it's");
++  });
++});
++
++describe('parseMyMemory', () => {
++  const ok = (translatedText: string, matches: unknown[] = []) => ({
++    responseStatus: 200,
++    responseData: { translatedText },
++    matches,
++  });
++
++  it('returns the main translation first, then matching alternatives', () => {
++    const data = ok('사과', [
++      { segment: 'ябълка', translation: '사과', match: 1 },
++      { segment: 'Ябълка', translation: '애플', match: 0.9 },
++      { segment: 'ябълково дърво', translation: '사과나무', match: 0.7 },
++    ]);
++    expect(parseMyMemory(data, 'ябълка', 'ko')).toEqual(['사과', '애플']);
++  });
++  it('drops an untranslated echo of the query', () => {
++    expect(() => parseMyMemory(ok('ябълка'), 'ябълка', 'ko')).toThrow(TranslateError);
++  });
++  it('reports the daily limit', () => {
++    const data = ok('MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS FOR TODAY.');
++    expect(() => parseMyMemory(data, 'ябълка', 'ko')).toThrow(/daily limit/);
++    expect(() => parseMyMemory({ responseStatus: '429' }, 'x', 'ko')).toThrow(/daily limit/);
++  });
++  it('reports an unsupported language pair', () => {
++    const data = { responseStatus: 403, responseDetails: "'XX' IS AN INVALID TARGET LANGUAGE" };
++    expect(() => parseMyMemory(data, 'ябълка', 'xx')).toThrow(/language pair/);
++  });
++});
++
++describe('translateWord', () => {
++  beforeEach(() => clearTranslationCache());
++
++  it('calls MyMemory once per word and caches the result', async () => {
++    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ responseStatus: 200, responseData: { translatedText: '사과' } })));
++    expect(await translateWord('ябълка; ябълки', 'bg', 'ko', undefined, fetchImpl)).toEqual(['사과']);
++    expect(await translateWord('Ябълка', 'bg', 'ko', undefined, fetchImpl)).toEqual(['사과']);
++    expect(fetchImpl).toHaveBeenCalledTimes(1);
++    const url = new URL(String((fetchImpl.mock.calls[0] as unknown[])[0]));
++    expect(url.searchParams.get('q')).toBe('ябълка');
++    expect(url.searchParams.get('langpair')).toBe('bg|ko');
++  });
++  it('turns network failures into a readable error', async () => {
++    const fetchImpl = vi.fn(async () => {
++      throw new TypeError('Failed to fetch');
++    });
++    await expect(translateWord('ябълка', 'bg', 'ko', undefined, fetchImpl)).rejects.toMatchObject({ kind: 'network' });
++  });
++});
+diff -ruN -x node_modules -x dist base/src/lib/translate.ts vocab/src/lib/translate.ts
+--- base/src/lib/translate.ts	1970-01-01 00:00:00.000000000 +0000
++++ vocab/src/lib/translate.ts	2026-10-06 13:05:22.448076482 +0000
+@@ -0,0 +1,191 @@
++import { normalize, splitVariants } from './text';
++
++/**
++ * Automatic translation for the word form.
++ *
++ * Uses the free MyMemory API (https://mymemory.translated.net/doc/spec.php): no key, CORS-enabled,
++ * about 5,000 characters a day per IP address. Nothing here needs a backend or the Blaze plan.
++ */
++
++export type Side = 'a' | 'b';
++
++/** A value the app wrote into a side by itself. It stays "auto" until the user edits that side. */
++export interface AutoFill {
++  side: Side;
++  value: string;
++}
++
++export type TranslateErrorKind = 'quota' | 'network' | 'none' | 'unsupported' | 'other';
++
++export class TranslateError extends Error {
++  constructor(
++    public kind: TranslateErrorKind,
++    message: string,
++  ) {
++    super(message);
++    this.name = 'TranslateError';
++  }
++}
++
++export function otherSide(side: Side): Side {
++  return side === 'a' ? 'b' : 'a';
++}
++
++/**
++ * What typing in `changed` should do to the other side:
++ * - `translate` when the other side is empty or still holds an untouched auto-translation,
++ * - `clear` when the source was emptied and the other side only holds an auto-translation,
++ * - `none` when the user typed the other side themselves (never overwrite their text).
++ */
++export function autoTranslatePlan(
++  changed: Side,
++  sourceText: string,
++  otherText: string,
++  auto: AutoFill | null,
++): 'translate' | 'clear' | 'none' {
++  const other = otherSide(changed);
++  const otherIsAuto = auto !== null && auto.side === other && auto.value === otherText;
++  const otherIsFree = otherText.trim() === '' || otherIsAuto;
++  if (!otherIsFree) return 'none';
++  if (queryFor(sourceText) === '') return otherIsAuto ? 'clear' : 'none';
++  return 'translate';
++}
++
++/** The text sent for translation: the first variant only ("хубав; красив" → "хубав"). */
++export function queryFor(text: string): string {
++  return (splitVariants(text)[0] ?? '').slice(0, 100);
++}
++
++/** MyMemory language codes. Most app codes work as they are. */
++export function apiLang(code: string): string {
++  const map: Record<string, string> = { zh: 'zh-CN' };
++  return map[code] ?? code;
++}
++
++const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
++
++function decodeEntities(s: string): string {
++  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body: string) => {
++    if (body[0] === '#') {
++      const n = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
++      return Number.isFinite(n) ? String.fromCodePoint(n) : whole;
++    }
++    return ENTITIES[body.toLowerCase()] ?? whole;
++  });
++}
++
++function isUpper(ch: string | undefined): boolean {
++  return !!ch && ch !== ch.toLowerCase() && ch === ch.toUpperCase();
++}
++
++/**
++ * Tidy a raw translation: decode HTML entities, drop quotes and sentence punctuation, and lower-case
++ * a capital first letter the source word did not have ("Ябълка" for "사과" → "ябълка").
++ * German keeps its capitals because nouns are capitalised.
++ */
++export function cleanTranslation(raw: string, query: string, target: string): string {
++  let s = decodeEntities(raw).replace(/\s+/g, ' ').trim();
++  s = s.replace(/^["'“”„«»「」]+|["'“”„«»「」]+$/g, '').trim();
++  s = s.replace(/[.!?。！？]+$/u, '').trim();
++  const chars = Array.from(s);
++  if (target !== 'de' && !isUpper(Array.from(query)[0]) && isUpper(chars[0]) && !isUpper(chars[1])) {
++    chars[0] = chars[0].toLowerCase();
++    s = chars.join('');
++  }
++  return s;
++}
++
++interface MyMemoryMatch {
++  segment?: unknown;
++  translation?: unknown;
++  match?: unknown;
++}
++
++interface MyMemoryResponse {
++  responseStatus?: unknown;
++  responseDetails?: unknown;
++  responseData?: { translatedText?: unknown };
++  matches?: unknown;
++}
++
++const QUOTA_MESSAGE = 'The free translation service’s daily limit is used up. Type the translation yourself, or try again tomorrow.';
++
++/**
++ * Turn a MyMemory /get response into translations, best first (at most 4, no duplicates,
++ * no echo of the query). Throws TranslateError when there is nothing usable.
++ */
++export function parseMyMemory(data: unknown, query: string, target: string): string[] {
++  const res = (data ?? {}) as MyMemoryResponse;
++  const status = Number(res.responseStatus);
++  const details = typeof res.responseDetails === 'string' ? res.responseDetails : '';
++  const main = typeof res.responseData?.translatedText === 'string' ? res.responseData.translatedText : '';
++
++  if (status === 429 || /MYMEMORY WARNING|USED ALL AVAILABLE FREE TRANSLATIONS/i.test(main + details)) {
++    throw new TranslateError('quota', QUOTA_MESSAGE);
++  }
++  if (status !== 200) {
++    if (/INVALID (SOURCE|TARGET) LANGUAGE|LANGPAIR/i.test(details)) {
++      throw new TranslateError('unsupported', 'Automatic translation isn’t available for this language pair.');
++    }
++    throw new TranslateError('other', 'Couldn’t translate this word. Type the translation yourself.');
++  }
++
++  const qNorm = normalize(query);
++  const matches = (Array.isArray(res.matches) ? (res.matches as MyMemoryMatch[]) : [])
++    .filter((m) => typeof m.translation === 'string' && typeof m.segment === 'string' && normalize(m.segment) === qNorm)
++    .sort((x, y) => Number(y.match ?? 0) - Number(x.match ?? 0))
++    .map((m) => m.translation as string);
++
++  const out: string[] = [];
++  const seen = new Set<string>([qNorm]);
++  for (const raw of [main, ...matches]) {
++    const clean = cleanTranslation(raw, query, target);
++    const key = normalize(clean);
++    if (!key || clean.length > 60 || seen.has(key)) continue;
++    seen.add(key);
++    out.push(clean);
++    if (out.length === 4) break;
++  }
++  if (out.length === 0) throw new TranslateError('none', 'No translation found. Type it yourself.');
++  return out;
++}
++
++export function isAbort(err: unknown): boolean {
++  return typeof err === 'object' && err !== null && (err as { name?: unknown }).name === 'AbortError';
++}
++
++const cache = new Map<string, string[]>();
++
++/** Translate one word or short phrase. Results are cached for the session. */
++export async function translateWord(
++  text: string,
++  from: string,
++  to: string,
++  signal?: AbortSignal,
++  fetchImpl: typeof fetch = fetch,
++): Promise<string[]> {
++  const query = queryFor(text);
++  if (!query) return [];
++  const key = `${from}|${to}|${normalize(query)}`;
++  const hit = cache.get(key);
++  if (hit) return hit;
++
++  const params = new URLSearchParams({ q: query, langpair: `${apiLang(from)}|${apiLang(to)}` });
++  let data: unknown;
++  try {
++    const res = await fetchImpl(`https://api.mymemory.translated.net/get?${params}`, { signal });
++    if (res.status === 429) throw new TranslateError('quota', QUOTA_MESSAGE);
++    data = await res.json();
++  } catch (err) {
++    if (err instanceof TranslateError || isAbort(err)) throw err;
++    throw new TranslateError('network', 'Couldn’t reach the translation service. Check your connection.');
++  }
++  const result = parseMyMemory(data, query, to);
++  cache.set(key, result);
++  return result;
++}
++
++/** For tests. */
++export function clearTranslationCache() {
++  cache.clear();
++}
+diff -ruN -x node_modules -x dist base/src/lib/types.ts vocab/src/lib/types.ts
+--- base/src/lib/types.ts	2026-10-06 13:11:13.913017375 +0000
++++ vocab/src/lib/types.ts	2026-10-06 13:05:44.456596514 +0000
+@@ -23,6 +23,8 @@
+   langB: string;
+   quizSize: number;
+   typoTolerance: boolean;
++  /** Fill the other side with a machine translation while typing a new word. */
++  autoTranslate: boolean;
+   createdAt: number;
+ }
+ 
+@@ -31,6 +33,7 @@
+   langB: 'ko',
+   quizSize: 20,
+   typoTolerance: true,
++  autoTranslate: true,
+ };
+ 
+ export function isComplete(entry: Pick<Entry, 'a' | 'b'>): boolean {
+diff -ruN -x node_modules -x dist base/src/styles.css vocab/src/styles.css
+--- base/src/styles.css	2026-10-06 13:11:13.913203310 +0000
++++ vocab/src/styles.css	2026-10-06 13:10:32.963517644 +0000
+@@ -338,6 +338,33 @@
+ .side-b .word-input {
+   border-bottom: 2px solid var(--side-b);
+ }
++/* automatic translation */
++.entry-form .field {
++  align-content: start;
++}
++.side-a .word-input.is-auto {
++  background: var(--side-a-soft);
++}
++.side-b .word-input.is-auto {
++  background: var(--side-b-soft);
++}
++.translate-note {
++  font-size: 0.8rem;
++  color: var(--muted);
++  min-height: 1.2rem;
++}
++.translate-note:empty {
++  min-height: 0;
++}
++.translate-error {
++  color: var(--bad);
++}
++.translate-alts .link-btn {
++  font-family: var(--font-word);
++  font-size: 0.85rem;
++  margin-left: 0.5rem;
++  padding: 0;
++}
+ .hint {
+   font-size: 0.85rem;
+   color: var(--muted);

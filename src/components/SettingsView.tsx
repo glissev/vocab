@@ -30,6 +30,18 @@ export function SettingsView({ uid, profile, entries, user }: Props) {
       </section>
 
       <section className="panel">
+        <h2>Adding words</h2>
+        <label className="checkbox">
+          <input type="checkbox" checked={profile.autoTranslate} onChange={(e) => saveProfile(uid, { autoTranslate: e.target.checked })} />
+          Translate new words automatically
+        </label>
+        <p className="hint">
+          When you type a word on one side, the other side fills in with a suggestion you can edit. Uses the free MyMemory
+          service, which receives the word you type and allows about 5,000 characters a day.
+        </p>
+      </section>
+
+      <section className="panel">
         <h2>Quiz</h2>
         <div className="field">
           <label htmlFor="st-size">Default number of words</label>

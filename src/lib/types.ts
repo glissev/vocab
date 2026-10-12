@@ -23,6 +23,8 @@ export interface Profile {
   langB: string;
   quizSize: number;
   typoTolerance: boolean;
+  /** Fill the other side with a machine translation while typing a new word. */
+  autoTranslate: boolean;
   createdAt: number;
 }
 
@@ -31,6 +33,7 @@ export const DEFAULT_PROFILE: Omit<Profile, 'createdAt'> = {
   langB: 'ko',
   quizSize: 20,
   typoTolerance: true,
+  autoTranslate: true,
 };
 
 export function isComplete(entry: Pick<Entry, 'a' | 'b'>): boolean {
